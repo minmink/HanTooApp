@@ -31,6 +31,7 @@ android {
 
         buildConfigField("String", "HANTOO_APP_KEY", "\"${localProperties.getProperty("hantoo.app.key") ?: ""}\"")
         buildConfigField("String", "HANTOO_APP_SECRET", "\"${localProperties.getProperty("hantoo.app.secret") ?: ""}\"")
+        buildConfigField("String", "HANTOO_ACCOUNT_NUMBER", "\"${localProperties.getProperty("hantoo.account.number") ?: ""}\"")
     }
 
     buildTypes {
@@ -59,6 +60,7 @@ dependencies {
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)
+    implementation(libs.androidx.compose.material.icons.extended)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.okhttp)
