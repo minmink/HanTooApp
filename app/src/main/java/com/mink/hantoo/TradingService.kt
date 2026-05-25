@@ -24,8 +24,9 @@ class TradingService : Service() {
     private val gson = Gson()
     private var isRunning = false
     private var monitorTimer: Timer? = null
+    private var isFinishNotified = false
 
-    // 실전 매매용 설정
+    // 실전 매매용 설정 (확정)
     private val baseUrl = "https://openapi.koreainvestment.com:9443"
     private val appKey = BuildConfig.HANTOO_APP_KEY
     private val appSecret = BuildConfig.HANTOO_APP_SECRET
@@ -52,6 +53,7 @@ class TradingService : Service() {
     private fun resetSession() {
         monitoringMap.clear()
         currentBoughtCount = 0
+        Log.d("Trading", "실전 세션 초기화 완료 (새로운 하루 준비)")
     }
 
     private fun startForegroundService() {
@@ -60,8 +62,8 @@ class TradingService : Service() {
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
 
         val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("한투 실전 자동매매 중")
-            .setContentText("09:00 ~ 15:20 실전 전략 가동 중...")
+            .setContentTitle("한투 실전 자동매매 서버 가동 중")
+            .setContentText("현재 장외 대기 또는 실전 전략 실행 중...")
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setOngoing(true)
             .build()
@@ -79,33 +81,35 @@ class TradingService : Service() {
                 val minute = now.get(Calendar.MINUTE)
                 val currentTimeValue = hour * 100 + minute
 
+                // 1. 아침 8시 50분 초기화
+                if (hour == 8 && minute == 50) {
+                    resetSession()
+                    isFinishNotified = false
+                }
+
+                // 2. 09:00 ~ 15:19: 실전 매매 가동
                 if (currentTimeValue in 900..1519) {
                     executeStrategy(token)
+                    isFinishNotified = false 
                 } 
+                // 3. 15:20 ~ 15:29: 실전 전량 청산
                 else if (currentTimeValue in 1520..1529) {
                     liquidateAll(token)
                 }
-                else if (currentTimeValue >= 1530) {
-                    stopTradingAndNotify()
+                // 4. 15:30 이상: 대기 모드 및 알림
+                else if (currentTimeValue >= 1530 && !isFinishNotified) {
+                    showFinalNotification()
+                    isFinishNotified = true
                 }
             }
         }
     }
 
-    private fun stopTradingAndNotify() {
-        showFinalNotification()
-        val stopIntent = Intent(ACTION_TRADING_STOPPED)
-        stopIntent.setPackage(packageName)
-        sendBroadcast(stopIntent)
-        isRunning = false
-        stopSelf()
-    }
-
     private fun showFinalNotification() {
         val channelId = "hantoo_trading_channel"
         val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("실전 자동매매 종료")
-            .setContentText("오늘의 모든 실전 매매가 종료되었습니다.")
+            .setContentTitle("실전 자동매매 마감")
+            .setContentText("오늘의 실전 매매가 종료되었습니다. 내일 9시에 자동 재개됩니다.")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
@@ -157,6 +161,7 @@ class TradingService : Service() {
                     val K = prevHigh - prevLow
                     val targetPrice = todayOpen + (K * 0.5)
                     monitoringMap[code] = MonitoringStock(code, stock.name, todayOpen, targetPrice)
+                    Log.d("Trading", "[${stock.name}] 실전 목표가 설정: $targetPrice")
                 }
             } else {
                 if (!monitorData.isBought && !monitorData.isSoldToday) {
@@ -180,7 +185,7 @@ class TradingService : Service() {
         val request = Request.Builder().url(url)
             .header("authorization", "Bearer $token")
             .header("appkey", appKey).header("appsecret", appSecret)
-            .header("tr_id", "FHKST01010400").build()
+            .header("tr_id", "FHKST01010400").header("custtype", "P").build()
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {}
@@ -203,7 +208,7 @@ class TradingService : Service() {
         val request = Request.Builder().url(url)
             .header("authorization", "Bearer $token")
             .header("appkey", appKey).header("appsecret", appSecret)
-            .header("tr_id", "FHKST01010100").build()
+            .header("tr_id", "FHKST01010100").header("custtype", "P").build()
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {}
@@ -229,7 +234,7 @@ class TradingService : Service() {
         val requestBody = gson.toJson(body).toRequestBody("application/json".toMediaType())
         val request = Request.Builder().url("$baseUrl/uapi/domestic-stock/v1/trading/order-cash").post(requestBody)
             .header("authorization", "Bearer $token").header("appkey", appKey).header("appsecret", appSecret)
-            .header("tr_id", "TTTC0802U").build() // 실전 매수 TR
+            .header("tr_id", "TTTC0802U").header("custtype", "P").build()
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) { currentBoughtCount--; stock.isBought = false }
@@ -244,7 +249,7 @@ class TradingService : Service() {
         val requestBody = gson.toJson(body).toRequestBody("application/json".toMediaType())
         val request = Request.Builder().url("$baseUrl/uapi/domestic-stock/v1/trading/order-cash").post(requestBody)
             .header("authorization", "Bearer $token").header("appkey", appKey).header("appsecret", appSecret)
-            .header("tr_id", "TTTC0801U").build() // 실전 매도 TR
+            .header("tr_id", "TTTC0801U").header("custtype", "P").build()
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {}
@@ -264,7 +269,12 @@ class TradingService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 }
 
+// Data Models
 data class TradeValueResponse(val output: List<TradeValueInfo>?)
 data class TradeValueInfo(@SerializedName("hts_kor_isnm") val name: String, @SerializedName("mksc_shrn_iscd") val code: String, @SerializedName("stck_prpr") val price: String)
 data class PriceDetail(val currentPrice: String)
-data class MonitoringStock(val code: String, val name: String, val openPrice: Double, val targetPrice: Double, var isBought: Boolean = false, var isSoldToday: Boolean = false, var buyPrice: Double = 0.0, var quantity: Int = 0)
+data class MonitoringStock(
+    val code: String, val name: String, val openPrice: Double, val targetPrice: Double,
+    var isBought: Boolean = false, var isSoldToday: Boolean = false,
+    var buyPrice: Double = 0.0, var quantity: Int = 0
+)
