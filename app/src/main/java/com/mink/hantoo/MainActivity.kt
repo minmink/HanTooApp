@@ -52,7 +52,9 @@ import java.util.Locale
 class MainActivity : ComponentActivity() {
     private val client = OkHttpClient()
     private val gson = Gson()
-    private val baseUrl = "https://openapivts.koreainvestment.com:29443"
+    
+    // 실전 매매용 설정
+    private val baseUrl = "https://openapi.koreainvestment.com:9443"
     private val appKey = BuildConfig.HANTOO_APP_KEY
     private val appSecret = BuildConfig.HANTOO_APP_SECRET
     private val accountNum = BuildConfig.HANTOO_ACCOUNT_NUMBER
@@ -89,7 +91,6 @@ class MainActivity : ComponentActivity() {
                 var selectedStockCode by remember { mutableStateOf<String?>(null) }
                 var selectedStockName by remember { mutableStateOf<String?>(null) }
 
-                // 1. 브로드캐스트 리시버로 실시간 동기화
                 DisposableEffect(Unit) {
                     val receiver = object : BroadcastReceiver() {
                         override fun onReceive(context: Context?, intent: Intent?) {
@@ -108,7 +109,6 @@ class MainActivity : ComponentActivity() {
                     onDispose { context.unregisterReceiver(receiver) }
                 }
 
-                // 2. 앱 화면으로 돌아올 때마다 상태 강제 재확인 (보조 장치)
                 DisposableEffect(lifecycleOwner) {
                     val observer = LifecycleEventObserver { _, event ->
                         if (event == Lifecycle.Event.ON_RESUME) {
@@ -203,14 +203,14 @@ class MainActivity : ComponentActivity() {
                                     kosdaqStocks = kosdaqStocks,
                                     onStart = {
                                         isTrading = true
-                                        dialogMessage = "자동매매를 시작합니다."
+                                        dialogMessage = "실전 자동매매를 시작합니다."
                                         showDialog = true
                                         val serviceIntent = Intent(context, TradingService::class.java)
                                         context.startForegroundService(serviceIntent)
                                     },
                                     onStop = {
                                         isTrading = false
-                                        dialogMessage = "자동매매를 중단합니다."
+                                        dialogMessage = "실전 자동매매를 중단합니다."
                                         showDialog = true
                                         val serviceIntent = Intent(context, TradingService::class.java)
                                         context.stopService(serviceIntent)
@@ -266,7 +266,7 @@ class MainActivity : ComponentActivity() {
 
     private fun fetchVolumeRanking(token: String, marketCode: String, onResult: (List<StockInfo>) -> Unit) {
         val url = HttpUrl.Builder()
-            .scheme("https").host("openapivts.koreainvestment.com").port(29443)
+            .scheme("https").host("openapi.koreainvestment.com").port(9443)
             .addPathSegments("uapi/domestic-stock/v1/ranking/volume")
             .addQueryParameter("FID_COND_MRKT_DIV_CODE", marketCode)
             .addQueryParameter("FID_COND_SCR_DIV_CODE", "20171")
@@ -301,7 +301,7 @@ class MainActivity : ComponentActivity() {
         val acntPrdtCd = accountNum.split("-").getOrNull(1) ?: "01"
         if (cano.isEmpty()) return
         val url = HttpUrl.Builder()
-            .scheme("https").host("openapivts.koreainvestment.com").port(29443)
+            .scheme("https").host("openapi.koreainvestment.com").port(9443)
             .addPathSegments("uapi/domestic-stock/v1/trading/inquire-balance")
             .addQueryParameter("CANO", cano).addQueryParameter("ACNT_PRDT_CD", acntPrdtCd)
             .addQueryParameter("AFHR_FLG", "N").addQueryParameter("O_STRT_DSRT_CD", "00")
@@ -312,7 +312,7 @@ class MainActivity : ComponentActivity() {
             .build()
         val request = Request.Builder().url(url).header("authorization", "Bearer $token")
             .header("appkey", appKey).header("appsecret", appSecret)
-            .header("tr_id", "VTRP6447R").header("custtype", "P").build()
+            .header("tr_id", "TTTC8434R").header("custtype", "P").build() // 실전 잔고 조회 TR
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) { onResult(emptyList()) }
             override fun onResponse(call: Call, response: Response) {
