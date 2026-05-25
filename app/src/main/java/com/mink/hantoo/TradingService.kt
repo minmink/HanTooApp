@@ -16,6 +16,10 @@ import java.util.*
 import kotlin.concurrent.timer
 
 class TradingService : Service() {
+    companion object {
+        const val ACTION_TRADING_STOPPED = "com.mink.hantoo.ACTION_TRADING_STOPPED"
+    }
+
     private val client = OkHttpClient()
     private val gson = Gson()
     private var isRunning = false
@@ -26,15 +30,12 @@ class TradingService : Service() {
     private val appSecret = BuildConfig.HANTOO_APP_SECRET
     private val accountNum = BuildConfig.HANTOO_ACCOUNT_NUMBER
 
-    // 설정 값
-    private val BUY_AMOUNT_PER_STOCK = 1_000_000.0 // 종목당 100만원
-    private val MAX_HOLDINGS = 5 // 최대 5종목
-    private val CHECK_INTERVAL = 10000L // 10초
-    private val MONITOR_COUNT = 20 // 감시할 거래대금 상위 종목 수 (API 부하 방지용)
+    private val BUY_AMOUNT_PER_STOCK = 1_000_000.0 
+    private val MAX_HOLDINGS = 5 
+    private val CHECK_INTERVAL = 10000L 
+    private val MONITOR_COUNT = 20 
 
-    // 종목 코드별 감시 데이터
     private val monitoringMap = mutableMapOf<String, MonitoringStock>()
-    // 현재 실제 보유 종목 수 (세션 내 관리)
     private var currentBoughtCount = 0
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -59,8 +60,9 @@ class TradingService : Service() {
 
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("한투 자동매매 가동 중")
-            .setContentText("고도화된 단타 전략(이평선/체결강도/VI) 감시 중...")
+            .setContentText("09:00 ~ 15:20 사이에만 전략이 실행됩니다.")
             .setSmallIcon(android.R.drawable.ic_media_play)
+            .setOngoing(true)
             .build()
 
         startForeground(1, notification)
@@ -70,13 +72,55 @@ class TradingService : Service() {
         monitorTimer = timer(period = CHECK_INTERVAL) {
             if (isRunning) {
                 val token = getSavedToken() ?: return@timer
-                executeStrategy(token)
+                
+                val now = Calendar.getInstance(TimeZone.getTimeZone("Asia/Seoul"))
+                val hour = now.get(Calendar.HOUR_OF_DAY)
+                val minute = now.get(Calendar.MINUTE)
+                val currentTimeValue = hour * 100 + minute
+
+                if (currentTimeValue in 900..1519) {
+                    executeStrategy(token)
+                } 
+                else if (currentTimeValue in 1520..1529) {
+                    liquidateAll(token)
+                }
+                else if (currentTimeValue >= 1530) {
+                    stopTradingAndNotify()
+                }
+                else {
+                    Log.d("Trading", "현재 시간($hour:$minute) - 장외 대기 중...")
+                }
             }
         }
     }
 
+    private fun stopTradingAndNotify() {
+        showFinalNotification()
+        
+        // 브로드캐스트 전송 (명시적 인텐트 설정으로 확실하게 전달)
+        val stopIntent = Intent(ACTION_TRADING_STOPPED)
+        stopIntent.setPackage(packageName)
+        sendBroadcast(stopIntent)
+        
+        isRunning = false
+        stopSelf()
+    }
+
+    private fun showFinalNotification() {
+        val channelId = "hantoo_trading_channel"
+        val notification = NotificationCompat.Builder(this, channelId)
+            .setContentTitle("자동매매 종료")
+            .setContentText("오늘의 자동매매가 모두 종료되었습니다.")
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .build()
+            
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.notify(2, notification)
+    }
+
     private fun executeStrategy(token: String) {
-        // 거래대금 상위 종목 조회
         val url = HttpUrl.Builder()
             .scheme("https").host("openapivts.koreainvestment.com").port(29443)
             .addPathSegments("uapi/domestic-stock/v1/ranking/trade-value")
@@ -95,25 +139,18 @@ class TradingService : Service() {
         val request = Request.Builder()
             .url(url)
             .header("authorization", "Bearer $token")
-            .header("appkey", appKey)
-            .header("appsecret", appSecret)
-            .header("tr_id", "FHPST01760000")
-            .header("custtype", "P")
-            .build()
+            .header("appkey", appKey).header("appsecret", appSecret)
+            .header("tr_id", "FHPST01760000").header("custtype", "P").build()
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {}
             override fun onResponse(call: Call, response: Response) {
                 val body = response.body?.string() ?: return
                 val data = gson.fromJson(body, TradeValueResponse::class.java)
-                // 상위 MONITOR_COUNT개 종목만 분석하여 API 부하 방지
                 data.output?.take(MONITOR_COUNT)?.forEachIndexed { index, stock ->
-                    // 각 종목 조회를 약간의 시차를 두고 실행 (burst 방지)
                     Timer().schedule(object : TimerTask() {
-                        override fun run() {
-                            if (isRunning) processStock(token, stock)
-                        }
-                    }, index * 200L) // 0.2초 간격으로 분산
+                        override fun run() { if (isRunning) processStock(token, stock) }
+                    }, index * 200L)
                 }
             }
         })
@@ -121,47 +158,64 @@ class TradingService : Service() {
 
     private fun processStock(token: String, stock: TradeValueInfo) {
         val code = stock.code
-        
-        // 1. 상세 정보 조회 (현재가, 체결강도, VI가격 등)
         fetchDetailedPrice(token, code) { detail ->
-            val strength = detail.strength.toDoubleOrNull() ?: 0.0
             val currentPrice = detail.currentPrice.toDoubleOrNull() ?: 0.0
-            val viPrice = detail.viPrice.toDoubleOrNull() ?: 0.0
-            val openPrice = detail.openPrice.toDoubleOrNull() ?: 0.0
-            
-            // 2. 분봉 데이터 조회 (이평선 계산용)
-            fetchMinutesChart(token, code) { candles ->
-                val ma3 = candles.take(3).map { it.close.toDouble() }.average()
-                val ma5 = candles.take(5).map { it.close.toDouble() }.average()
-                
-                val monitorData = monitoringMap[code] ?: MonitoringStock(code, stock.name, openPrice, openPrice * 1.02)
-                monitoringMap[code] = monitorData
+            val monitorData = monitoringMap[code]
 
-                // 3. 통합 매수 조건 판단
-                val isBreakout = currentPrice >= monitorData.targetPrice // 시가 대비 2% 돌파
-                val isStrongPush = strength >= 120.0 // 체결강도 120% 이상
-                val isGoldenCross = ma3 > ma5 // 3/5 이평선 골든크로스
-                val isBeforeVI = currentPrice < viPrice && currentPrice >= viPrice * 0.98 // VI 직전 (2% 이내)
-
-                if (!monitorData.isBought && currentPrice > 0 && currentBoughtCount < MAX_HOLDINGS) {
-                    if (isBreakout && isStrongPush && isGoldenCross && isBeforeVI) {
-                        Log.d("Trading", "🔥 타점 포착! [${stock.name}] - 현재가: $currentPrice, 체결강도: $strength%")
+            if (monitorData == null) {
+                fetchPrevDayData(token, code) { prevHigh, prevLow, todayOpen ->
+                    val K = prevHigh - prevLow
+                    val targetPrice = todayOpen + (K * 0.5)
+                    monitoringMap[code] = MonitoringStock(code, stock.name, todayOpen, targetPrice)
+                    Log.d("Trading", "[${stock.name}] 목표가 설정: $targetPrice")
+                }
+            } else {
+                if (!monitorData.isBought && !monitorData.isSoldToday) {
+                    if (currentPrice >= monitorData.targetPrice && currentBoughtCount < MAX_HOLDINGS) {
                         buyStock(token, monitorData, currentPrice)
+                    }
+                } else if (monitorData.isBought) {
+                    val profitRate = (currentPrice - monitorData.buyPrice) / monitorData.buyPrice
+                    if (profitRate >= 0.03) {
+                        sellStock(token, monitorData, "익절(+3%)")
+                    } else if (profitRate <= -0.015) {
+                        sellStock(token, monitorData, "손절(-1.5%)")
                     }
                 }
             }
         }
     }
 
+    private fun fetchPrevDayData(token: String, code: String, onResult: (Double, Double, Double) -> Unit) {
+        val url = "$baseUrl/uapi/domestic-stock/v1/quotations/inquire-daily-price?FID_COND_MRKT_DIV_CODE=J&FID_INPUT_ISCD=$code&FID_PERIOD_DIV_CODE=D&FID_ORG_ADJ_PRC=0"
+        val request = Request.Builder().url(url)
+            .header("authorization", "Bearer $token")
+            .header("appkey", appKey).header("appsecret", appSecret)
+            .header("tr_id", "FHKST01010400").build()
+
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {}
+            override fun onResponse(call: Call, response: Response) {
+                val body = response.body?.string() ?: return
+                val root = gson.fromJson(body, Map::class.java)
+                val list = root["output"] as? List<Map<*, *>>
+                val yesterday = list?.get(1)
+                val today = list?.get(0)
+                
+                val prevHigh = yesterday?.get("stck_hgpr")?.toString()?.toDoubleOrNull() ?: 0.0
+                val prevLow = yesterday?.get("stck_lwpr")?.toString()?.toDoubleOrNull() ?: 0.0
+                val todayOpen = today?.get("stck_oprc")?.toString()?.toDoubleOrNull() ?: 0.0
+                onResult(prevHigh, prevLow, todayOpen)
+            }
+        })
+    }
+
     private fun fetchDetailedPrice(token: String, code: String, onResult: (PriceDetail) -> Unit) {
         val url = "$baseUrl/uapi/domestic-stock/v1/quotations/inquire-price?FID_COND_MRKT_DIV_CODE=J&FID_INPUT_ISCD=$code"
-        val request = Request.Builder()
-            .url(url)
+        val request = Request.Builder().url(url)
             .header("authorization", "Bearer $token")
-            .header("appkey", appKey)
-            .header("appsecret", appSecret)
-            .header("tr_id", "FHKST01010100")
-            .build()
+            .header("appkey", appKey).header("appsecret", appSecret)
+            .header("tr_id", "FHKST01010100").build()
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {}
@@ -169,102 +223,61 @@ class TradingService : Service() {
                 val body = response.body?.string() ?: return
                 val root = gson.fromJson(body, Map::class.java)
                 val output = root["output"] as? Map<*, *>
-                if (output != null) {
-                    onResult(PriceDetail(
-                        currentPrice = output["stck_prpr"].toString(),
-                        openPrice = output["stck_oprc"].toString(),
-                        strength = output["tck_shnu"].toString(),
-                        viPrice = output["vi_cls_prc"].toString()
-                    ))
-                }
-            }
-        })
-    }
-
-    private fun fetchMinutesChart(token: String, code: String, onResult: (List<Candle>) -> Unit) {
-        val url = "$baseUrl/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice?FID_COND_MRKT_DIV_CODE=J&FID_INPUT_ISCD=$code&FID_ETC_CLS_CODE=&FID_PW_DATA_INQR_YN=N"
-        val request = Request.Builder()
-            .url(url)
-            .header("authorization", "Bearer $token")
-            .header("appkey", appKey)
-            .header("appsecret", appSecret)
-            .header("tr_id", "FHKST03010200")
-            .build()
-
-        client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {}
-            override fun onResponse(call: Call, response: Response) {
-                val body = response.body?.string() ?: return
-                val root = gson.fromJson(body, Map::class.java)
-                val output2 = root["output2"] as? List<Map<*, *>>
-                val candles = output2?.map { 
-                    Candle(close = it["stck_prpr"].toString())
-                } ?: emptyList()
-                onResult(candles)
+                if (output != null) onResult(PriceDetail(currentPrice = output["stck_prpr"].toString()))
             }
         })
     }
 
     private fun buyStock(token: String, stock: MonitoringStock, currentPrice: Double) {
-        stock.isBought = true 
+        stock.isBought = true; stock.buyPrice = currentPrice
         currentBoughtCount++
-
         val quantity = (BUY_AMOUNT_PER_STOCK / currentPrice).toInt()
+        stock.quantity = quantity
         if (quantity <= 0) return
 
         val cano = accountNum.split("-").first()
         val acntCd = accountNum.split("-").getOrNull(1) ?: "01"
-
-        val body = mapOf(
-            "CANO" to cano,
-            "ACNT_PRDT_CD" to acntCd,
-            "PDNO" to stock.code,
-            "ORD_DVSN" to "01",
-            "ORD_QTY" to quantity.toString(),
-            "ORD_UNPR" to "0"
-        )
-
+        val body = mapOf("CANO" to cano, "ACNT_PRDT_CD" to acntCd, "PDNO" to stock.code, "ORD_DVSN" to "01", "ORD_QTY" to quantity.toString(), "ORD_UNPR" to "0")
         val requestBody = gson.toJson(body).toRequestBody("application/json".toMediaType())
-        val request = Request.Builder()
-            .url("$baseUrl/uapi/domestic-stock/v1/trading/order-cash")
-            .post(requestBody)
-            .header("authorization", "Bearer $token")
-            .header("appkey", appKey)
-            .header("appsecret", appSecret)
-            .header("tr_id", "VTRP0020U")
-            .build()
+        val request = Request.Builder().url("$baseUrl/uapi/domestic-stock/v1/trading/order-cash").post(requestBody)
+            .header("authorization", "Bearer $token").header("appkey", appKey).header("appsecret", appSecret)
+            .header("tr_id", "VTRP0020U").build()
 
         client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                currentBoughtCount--
-                stock.isBought = false
-            }
+            override fun onFailure(call: Call, e: IOException) { currentBoughtCount--; stock.isBought = false }
+            override fun onResponse(call: Call, response: Response) { Log.d("Trading", "✅ 매수: ${stock.name}") }
+        })
+    }
+
+    private fun sellStock(token: String, stock: MonitoringStock, reason: String) {
+        val cano = accountNum.split("-").first()
+        val acntCd = accountNum.split("-").getOrNull(1) ?: "01"
+        val body = mapOf("CANO" to cano, "ACNT_PRDT_CD" to acntCd, "PDNO" to stock.code, "ORD_DVSN" to "01", "ORD_QTY" to stock.quantity.toString(), "ORD_UNPR" to "0")
+        val requestBody = gson.toJson(body).toRequestBody("application/json".toMediaType())
+        val request = Request.Builder().url("$baseUrl/uapi/domestic-stock/v1/trading/order-cash").post(requestBody)
+            .header("authorization", "Bearer $token").header("appkey", appKey).header("appsecret", appSecret)
+            .header("tr_id", "VTRP0001U").build()
+
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {}
             override fun onResponse(call: Call, response: Response) {
-                Log.d("Trading", "✅ 매수 주문 성공: ${stock.name}")
+                stock.isBought = false; stock.isSoldToday = true; currentBoughtCount--
+                Log.d("Trading", "🚨 매도 [$reason]: ${stock.name}")
             }
         })
     }
 
-    private fun getSavedToken(): String? {
-        return getSharedPreferences("hantoo_prefs", Context.MODE_PRIVATE).getString("access_token", null)
+    private fun liquidateAll(token: String) {
+        monitoringMap.values.filter { it.isBought }.forEach { sellStock(token, it, "장 마감 청산") }
     }
 
-    override fun onDestroy() {
-        isRunning = false
-        monitorTimer?.cancel()
-        super.onDestroy()
-    }
-
+    private fun getSavedToken(): String? = getSharedPreferences("hantoo_prefs", Context.MODE_PRIVATE).getString("access_token", null)
+    override fun onDestroy() { isRunning = false; monitorTimer?.cancel(); super.onDestroy() }
     override fun onBind(intent: Intent?): IBinder? = null
 }
 
 // Data Models
 data class TradeValueResponse(val output: List<TradeValueInfo>?)
-data class TradeValueInfo(
-    @SerializedName("hts_kor_isnm") val name: String,
-    @SerializedName("mksc_shrn_iscd") val code: String,
-    @SerializedName("stck_prpr") val price: String
-)
-data class PriceDetail(val currentPrice: String, val openPrice: String, val strength: String, val viPrice: String)
-data class Candle(val close: String)
-data class MonitoringStock(val code: String, val name: String, val openPrice: Double, val targetPrice: Double, var isBought: Boolean = false)
+data class TradeValueInfo(@SerializedName("hts_kor_isnm") val name: String, @SerializedName("mksc_shrn_iscd") val code: String, @SerializedName("stck_prpr") val price: String)
+data class PriceDetail(val currentPrice: String)
+data class MonitoringStock(val code: String, val name: String, val openPrice: Double, val targetPrice: Double, var isBought: Boolean = false, var isSoldToday: Boolean = false, var buyPrice: Double = 0.0, var quantity: Int = 0)
