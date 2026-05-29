@@ -11,6 +11,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.google.gson.Gson
 import okhttp3.*
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
@@ -57,11 +58,15 @@ class TradingService : Service() {
     private val appSecret = BuildConfig.HANTOO_APP_SECRET
     private val accountNum = BuildConfig.HANTOO_ACCOUNT_NUMBER
 
+    private val monitoringStocks = mutableMapOf<String, MonitoringBotData>()
+    private var currentBoughtCount = 0
+    private val MAX_BUY_COUNT = 5 // 동시에 최대 5종목만 운용
+
     private var activeWatchlist = mutableListOf<Pair<String, String>>(
-        Pair("005930", "삼성전자"), Pair("000660", "SK하이닉스"), Pair("035420", "NAVER"),
-        Pair("247540", "에코프로비엠"), Pair("086520", "에코프로"), Pair("128940", "한미반도체"),
-        Pair("196170", "알테오젠"), Pair("012450", "한화에어로"), Pair("068270", "셀트리온"),
-        Pair("005380", "현대차"), Pair("000270", "기아"), Pair("035720", "카카오")
+        Pair("005930", "삼성전자"), Pair("000660", "SK하이닉스"), Pair("128940", "한미반도체"),
+        Pair("373220", "LG엔솔"), Pair("247540", "에코프로비엠"), Pair("086520", "에코프로"),
+        Pair("003670", "POSCO퓨처엠"), Pair("018260", "삼성SDS"), Pair("066570", "LG전자"),
+        Pair("005380", "현대차"), Pair("000270", "기아"), Pair("012330", "현대모비스")
     )
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -74,29 +79,107 @@ class TradingService : Service() {
     }
 
     private fun startTradingLogic() {
-        Log.e("HANTOO_LOG", "▶ 자동화 엔진 가동 시작")
+        Log.e("HANTOO_LOG", "▶ 자동화 엔진 [주도주 모드] 가동")
         
         monitorTimer = timer(period = 60000L) {
             if (!isRunning) return@timer
             val now = Calendar.getInstance(TimeZone.getTimeZone("Asia/Seoul"))
             val timeValue = now.get(Calendar.HOUR_OF_DAY) * 100 + now.get(Calendar.MINUTE)
             
+            // 8:50 토큰 갱신
             if (timeValue == 850) issueTokenInternally()
 
             val token = getSavedToken() ?: return@timer
-            if (timeValue in 900..905 && now.get(Calendar.MINUTE) % 5 == 0) refreshDailyRanking(token)
 
+            // 9:00 장 시작 시 종목 리스트 최신화 시도
+            if (timeValue == 900 && now.get(Calendar.MINUTE) == 0) refreshDailyRanking(token)
+
+            // 장중 실시간 감시 (9:00 ~ 15:14)
             if (timeValue in 900..1514) {
-                Log.d("HANTOO_LOG", "⏰ 감시 중: ${activeWatchlist.size}개 종목")
                 activeWatchlist.forEachIndexed { index, stock ->
                     Timer().schedule(object : TimerTask() {
                         override fun run() { checkStockStrategy(token, stock.first, stock.second) }
-                    }, index * 1200L)
+                    }, index * 1500L) // 종목당 1.5초 간격 (TPS 방어)
                 }
-            } else if (timeValue in 1515..1525) {
+            } 
+            // 15:15 전량 청산
+            else if (timeValue in 1515..1525) {
                 liquidateAll(token)
             }
         }
+    }
+
+    private fun checkStockStrategy(token: String, code: String, name: String) {
+        val url = "$baseUrl/uapi/domestic-stock/v1/quotations/inquire-price?FID_COND_MRKT_DIV_CODE=J&FID_INPUT_ISCD=$code"
+        val request = Request.Builder().url(url).header("authorization", "Bearer $token").header("appkey", appKey).header("appsecret", appSecret).header("tr_id", "FHKST01010100").header("custtype", "P").build()
+        
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {}
+            override fun onResponse(call: Call, response: Response) {
+                val body = response.body?.string() ?: return
+                val root = gson.fromJson(body, Map::class.java); val out = root["output"] as? Map<*, *> ?: return
+                
+                val currentPrice = out["stck_prpr"].toString().toDoubleOrNull() ?: 0.0
+                val openPrice = out["stck_oprc"].toString().toDoubleOrNull() ?: 0.0
+                
+                val stockData = monitoringStocks[code]
+                if (stockData == null) {
+                    fetchTargetPrice(token, code, openPrice) { target ->
+                        monitoringStocks[code] = MonitoringBotData(code, name, openPrice, target)
+                        Log.d("HANTOO_LOG", "🔍 [$name] 분석등록: 현재 $currentPrice / 목표 $target")
+                    }
+                } else {
+                    if (!stockData.isBought && !stockData.isSoldToday) {
+                        if (currentPrice >= stockData.targetPrice && currentBoughtCount < MAX_BUY_COUNT) {
+                            buyStock(token, stockData, currentPrice)
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    private fun fetchTargetPrice(token: String, code: String, todayOpen: Double, onResult: (Double) -> Unit) {
+        val url = "$baseUrl/uapi/domestic-stock/v1/quotations/inquire-daily-price?FID_COND_MRKT_DIV_CODE=J&FID_INPUT_ISCD=$code&FID_PERIOD_DIV_CODE=D&FID_ORG_ADJ_PRC=0"
+        val request = Request.Builder().url(url).header("authorization", "Bearer $token").header("appkey", appKey).header("appsecret", appSecret).header("tr_id", "FHKST01010400").header("custtype", "P").build()
+        
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {}
+            override fun onResponse(call: Call, response: Response) {
+                val body = response.body?.string() ?: return
+                val root = gson.fromJson(body, Map::class.java); val list = root["output"] as? List<Map<*, *>>
+                if (list != null && list.size >= 2) {
+                    val prevHigh = list[1]["stck_hgpr"].toString().toDoubleOrNull() ?: 0.0
+                    val prevLow = list[1]["stck_lwpr"].toString().toDoubleOrNull() ?: 0.0
+                    val k = 0.5
+                    val target = todayOpen + ((prevHigh - prevLow) * k)
+                    onResult(target)
+                }
+            }
+        })
+    }
+
+    private fun buyStock(token: String, stock: MonitoringBotData, price: Double) {
+        val cano = accountNum.split("-").first()
+        val acntCd = accountNum.split("-").getOrNull(1) ?: "01"
+        val qty = (1_000_000 / price).toInt()
+        if (qty <= 0) return
+
+        val body = mapOf("CANO" to cano, "ACNT_PRDT_CD" to acntCd, "PDNO" to stock.code, "ORD_DVSN" to "01", "ORD_QTY" to qty.toString(), "ORD_UNPR" to "0")
+        val request = Request.Builder().url("$baseUrl/uapi/domestic-stock/v1/trading/order-cash").post(gson.toJson(body).toRequestBody("application/json".toMediaType())).header("authorization", "Bearer $token").header("appkey", appKey).header("appsecret", appSecret).header("tr_id", "TTTC0802U").header("custtype", "P").build()
+
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {}
+            override fun onResponse(call: Call, response: Response) {
+                val res = gson.fromJson(response.body?.string(), OrderBotData::class.java)
+                if (res?.rt_cd == "0") {
+                    stock.isBought = true; stock.buyPrice = price; currentBoughtCount++
+                    Log.e("HANTOO_LOG", "✅ [${stock.name}] 매수 성공! 가격: $price")
+                } else {
+                    Log.e("HANTOO_LOG", "❌ [${stock.name}] 매수 실패: ${res?.msg1}")
+                }
+            }
+        })
     }
 
     private fun issueTokenInternally() {
@@ -121,7 +204,7 @@ class TradingService : Service() {
             override fun onResponse(call: Call, response: Response) {
                 val res = gson.fromJson(response.body?.string(), BalanceBotData::class.java)
                 res?.output1?.filter { (it.hldgQty.toIntOrNull() ?: 0) > 0 }?.forEach { stock ->
-                    Log.e("HANTOO_LOG", "🚨 장 마감 청산 주문: ${stock.prdtName}")
+                    Log.e("HANTOO_LOG", "🚨 장 마감 청산: ${stock.prdtName} 전량 매도 시도")
                 }
             }
         })
@@ -133,19 +216,18 @@ class TradingService : Service() {
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {}
             override fun onResponse(call: Call, response: Response) {
-                val data = gson.fromJson(response.body?.string(), RankingBotData::class.java)
-                val stocks = data.output?.take(30)
-                if (!stocks.isNullOrEmpty()) {
-                    activeWatchlist.clear()
-                    stocks.forEach { activeWatchlist.add(Pair(it.code, it.name)) }
-                    Log.e("HANTOO_LOG", "🔥 오늘의 전장 30개 선정 완료")
-                }
+                val resBody = response.body?.string() ?: return
+                try {
+                    val data = gson.fromJson(resBody, RankingBotData::class.java)
+                    val stocks = data.output?.take(30)
+                    if (!stocks.isNullOrEmpty()) {
+                        activeWatchlist.clear()
+                        stocks.forEach { activeWatchlist.add(Pair(it.code, it.name)) }
+                        Log.e("HANTOO_LOG", "🔥 오늘의 전장 30개 선정 완료")
+                    }
+                } catch (e: Exception) {}
             }
         })
-    }
-
-    private fun checkStockStrategy(token: String, code: String, name: String) {
-        // [전략 체크 로직]
     }
 
     private fun setupForeground() {
@@ -153,9 +235,9 @@ class TradingService : Service() {
             val channel = NotificationChannel(CHANNEL_ID, "자동매매 서비스", NotificationManager.IMPORTANCE_LOW)
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
-        val notification = NotificationCompat.Builder(this, CHANNEL_ID).setContentTitle("24시간 자동매매 봇 가동 중").setSmallIcon(android.R.drawable.ic_media_play).build()
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID).setContentTitle("24시간 자동매매 서버 가동 중").setSmallIcon(android.R.drawable.ic_media_play).build()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
             startForeground(1, notification)
         }
