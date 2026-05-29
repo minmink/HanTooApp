@@ -11,7 +11,10 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -21,6 +24,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -30,6 +34,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.google.gson.Gson
 import com.mink.hantoo.ui.theme.HantooTheme
@@ -95,6 +100,10 @@ class MainActivity : ComponentActivity() {
                 var statusMessage by remember { mutableStateOf("준비 완료") }
                 val stockPrices = remember { mutableStateMapOf<String, String>() }
                 val targetPrices = remember { mutableStateMapOf<String, String>() }
+                
+                // 상세 페이지 네비게이션 상태
+                var selectedStockCode by remember { mutableStateOf<String?>(null) }
+                var selectedStockName by remember { mutableStateOf<String?>(null) }
 
                 val permissionLauncher = rememberLauncherForActivityResult(
                     ActivityResultContracts.RequestPermission()
@@ -113,7 +122,7 @@ class MainActivity : ComponentActivity() {
                                             statusMessage = "${stock.second} 동기화"
                                         }
                                     }
-                                }, index * 700L) // 0.7초로 간격을 더 늘려 안정성 확보
+                                }, index * 700L)
                             }
                         }
                     }
@@ -126,71 +135,99 @@ class MainActivity : ComponentActivity() {
                     loadStocks()
                 }
 
-                Scaffold(
-                    topBar = { 
-                        CenterAlignedTopAppBar(
-                            title = { Text("실전 자동매매 (30개)", fontWeight = FontWeight.Bold) },
-                            actions = {
-                                IconButton(onClick = { loadStocks() }) {
-                                    Icon(Icons.Default.Refresh, contentDescription = "새로고침")
-                                }
-                            }
-                        ) 
+                // 뒤로가기 처리 (상세 페이지일 때만 가로채기)
+                if (selectedStockCode != null) {
+                    BackHandler { 
+                        selectedStockCode = null
+                        selectedStockName = null
                     }
-                ) { innerPadding ->
-                    Column(Modifier.padding(innerPadding).fillMaxSize()) {
-                        Card(Modifier.fillMaxWidth().padding(16.dp), colors = CardDefaults.cardColors(containerColor = if(isTrading) Color(0xFFE8F5E9) else Color(0xFFFFEBEE))) {
-                            Column(Modifier.padding(16.dp)) {
-                                Text("엔진: ${if(isTrading) "가동 중" else "중지됨"} | $statusMessage", fontWeight = FontWeight.Bold)
-                                Spacer(Modifier.height(12.dp))
-                                Row(Modifier.fillMaxWidth(), Arrangement.spacedBy(8.dp)) {
-                                    Button(modifier = Modifier.weight(1f), onClick = {
-                                        context.startForegroundService(Intent(context, TradingService::class.java))
-                                        isTrading = true
-                                    }, enabled = !isTrading) { Text("가동") }
-                                    Button(modifier = Modifier.weight(1f), onClick = {
-                                        context.stopService(Intent(context, TradingService::class.java))
-                                        isTrading = false
-                                    }, enabled = isTrading) { Text("중지") }
+                    
+                    Scaffold(
+                        topBar = { 
+                            TopAppBar(
+                                title = { Text(selectedStockName ?: "상세보기") },
+                                navigationIcon = {
+                                    IconButton(onClick = { 
+                                        selectedStockCode = null
+                                        selectedStockName = null
+                                    }) {
+                                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "뒤로가기")
+                                    }
+                                }
+                            )
+                        }
+                    ) { innerPadding ->
+                        StockDetailWebScreen(selectedStockCode!!, Modifier.padding(innerPadding))
+                    }
+                } else {
+                    // 메인 대시보드 화면
+                    Scaffold(
+                        topBar = { 
+                            CenterAlignedTopAppBar(
+                                title = { Text("실전 자동매매 (30개)", fontWeight = FontWeight.Bold) },
+                                actions = {
+                                    IconButton(onClick = { loadStocks() }) {
+                                        Icon(Icons.Default.Refresh, contentDescription = "새로고침")
+                                    }
+                                }
+                            ) 
+                        }
+                    ) { innerPadding ->
+                        Column(Modifier.padding(innerPadding).fillMaxSize()) {
+                            Card(Modifier.fillMaxWidth().padding(16.dp), colors = CardDefaults.cardColors(containerColor = if(isTrading) Color(0xFFE8F5E9) else Color(0xFFFFEBEE))) {
+                                Column(Modifier.padding(16.dp)) {
+                                    Text("엔진: ${if(isTrading) "가동 중" else "중지됨"} | $statusMessage", fontWeight = FontWeight.Bold)
+                                    Spacer(Modifier.height(12.dp))
+                                    Row(Modifier.fillMaxWidth(), Arrangement.spacedBy(8.dp)) {
+                                        Button(modifier = Modifier.weight(1f), onClick = {
+                                            context.startForegroundService(Intent(context, TradingService::class.java))
+                                            isTrading = true
+                                        }, enabled = !isTrading) { Text("가동") }
+                                        Button(modifier = Modifier.weight(1f), onClick = {
+                                            context.stopService(Intent(context, TradingService::class.java))
+                                            isTrading = false
+                                        }, enabled = isTrading) { Text("중지") }
+                                    }
                                 }
                             }
-                        }
-                        
-                        LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
-                            items(masterWatchlist) { stock ->
-                                val price = stockPrices[stock.first] ?: "로드 중"
-                                val isError = price == "에러" || price == "실패"
-                                
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clickable { 
-                                            // 클릭 시 해당 종목만 재시도
-                                            stockPrices[stock.first] = "재시도 중..."
-                                            checkAndIssueToken { token ->
-                                                if (token != null) fetchPriceAndTarget(token, stock.first) { cur, tgt ->
-                                                    stockPrices[stock.first] = cur
-                                                    targetPrices[stock.first] = tgt
+                            
+                            LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
+                                items(masterWatchlist) { stock ->
+                                    val price = stockPrices[stock.first] ?: "로드 중"
+                                    val isError = price == "에러" || price == "실패"
+                                    
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable { 
+                                                // 클릭 시 네이버 증권 페이지로 이동 + 해당 종목만 재시도
+                                                selectedStockCode = stock.first
+                                                selectedStockName = stock.second
+                                                checkAndIssueToken { token ->
+                                                    if (token != null) fetchPriceAndTarget(token, stock.first) { cur, tgt ->
+                                                        stockPrices[stock.first] = cur
+                                                        targetPrices[stock.first] = tgt
+                                                    }
                                                 }
-                                            }
-                                        },
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Column {
-                                        Text(stock.second, fontWeight = FontWeight.Bold)
-                                        Text(
-                                            text = "현재가: $price", 
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = if(isError) Color.Red else Color.Unspecified
-                                        )
+                                            },
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column {
+                                            Text(stock.second, fontWeight = FontWeight.Bold)
+                                            Text(
+                                                text = "현재가: $price", 
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = if(isError) Color.Red else Color.Unspecified
+                                            )
+                                        }
+                                        Column(horizontalAlignment = Alignment.End) {
+                                            Text("목표가", style = MaterialTheme.typography.labelSmall, color = Color.Red)
+                                            Text(targetPrices[stock.first] ?: "-", fontWeight = FontWeight.Bold, color = Color.Red)
+                                        }
                                     }
-                                    Column(horizontalAlignment = Alignment.End) {
-                                        Text("목표가", style = MaterialTheme.typography.labelSmall, color = Color.Red)
-                                        Text(targetPrices[stock.first] ?: "-", fontWeight = FontWeight.Bold, color = Color.Red)
-                                    }
+                                    HorizontalDivider(Modifier.padding(vertical = 8.dp), color = Color.LightGray)
                                 }
-                                HorizontalDivider(Modifier.padding(vertical = 8.dp), color = Color.LightGray)
                             }
                         }
                     }
@@ -245,4 +282,19 @@ class MainActivity : ComponentActivity() {
             }
         })
     }
+}
+
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+fun StockDetailWebScreen(code: String, modifier: Modifier = Modifier) {
+    AndroidView(
+        factory = { context ->
+            WebView(context).apply {
+                webViewClient = WebViewClient()
+                settings.javaScriptEnabled = true
+                loadUrl("https://m.stock.naver.com/domestic/stock/$code/total")
+            }
+        },
+        modifier = modifier.fillMaxSize()
+    )
 }
